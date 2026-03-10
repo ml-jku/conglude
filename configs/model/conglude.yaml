@@ -1,0 +1,55 @@
+_target_: conglude.model.ConGLUDeModel
+
+defaults:
+  - _self_
+  - vnegnn: vnegnn
+  - pocket_encoder: mlp
+  - protein_encoder: mlp
+  - ligand_encoder: mlp
+  - cluster: dbscan
+  - optimizer: adamw
+  - lr_scheduler: plateau_with_warmup
+
+segmentation_loss:
+  _target_: conglude.utils.losses.DiceLoss
+segmentation_loss_weight: 1.0
+
+vn_pos_loss:
+  _target_: conglude.utils.losses.VNPositionHuberLoss
+vn_pos_loss_weight: 1.0
+
+confidence_loss:
+  _target_: conglude.utils.losses.ConfidenceLoss
+  gamma: 4
+confidence_loss_weight: 1.0
+
+pocket_ranking_loss:
+  _target_: conglude.utils.losses.InfoNCELoss
+  temperature: 0.0625
+  dim: 1
+pocket_ranking_loss_weight: 1.0
+protein_loss:
+  _target_: conglude.utils.losses.InfoNCELoss
+  temperature: 0.0625
+  dim: 0
+protein_loss_weight: 1.0
+
+SB_virtual_screening_loss:
+  _target_: conglude.utils.losses.InfoNCELoss
+  temperature: 0.0442
+  dim: 1
+SB_virtual_screening_loss_weight: 1.0
+
+LB_virtual_screening_loss:
+  _target_: conglude.utils.losses.BCELoss
+  scaling: 1.0
+  shift: 0.0
+LB_virtual_screening_loss_weight: 6.0
+
+checkpoint_name: ${checkpoint_name}
+checkpoint_path: ./checkpoints
+
+num_pocket_nodes: 8
+protein_node: true
+save_predictions: false
+save_embeddings: false

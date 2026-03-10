@@ -1,0 +1,13 @@
+_target_: conglude.datamodule.ConGLUDeDataset
+
+dataset_dir: ./data/datasets/test_datasets/pdbbind_time
+dataset_name: pdbbind_time
+task: pr
+structure_based: true
+split: test
+batch_size: 64
+
+# processing options
+extract_ligands: all # extract all valid ligands from pdb files
+labeled_smiles: none # no smiles files provided
+multi_ligand: true # more than one ligand/binding site possible per target

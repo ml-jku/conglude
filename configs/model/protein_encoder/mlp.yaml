@@ -1,0 +1,6 @@
+_target_: conglude.modules.mlp.MLPEncoder
+num_layers: 1
+input_dim: 100
+output_dim: 256
+input_dropout: 0.1
+batch_norm: false

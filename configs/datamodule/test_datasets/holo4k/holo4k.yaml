@@ -1,0 +1,16 @@
+_target_: conglude.datamodule.ConGLUDeDataset
+
+dataset_dir: ./data/datasets/test_datasets/holo4k
+dataset_name: holo4k
+task: pp
+structure_based: true
+split: test
+batch_size: 64
+fingerprint_type: null
+load_descriptors: false
+
+# processing options
+extract_ligands: known # extract known ligands from csv file
+labeled_smiles: none # no smiles files provided
+multi_ligand: true # multiple ligands per target
+calc_mol_feats: false # dataset for pocket prediction, no need to calculate ligand features

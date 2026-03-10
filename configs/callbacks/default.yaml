@@ -1,0 +1,15 @@
+model_checkpoint:
+  _target_: conglude.utils.lightning.CustomModelCheckpoint
+  monitor: ${monitor}
+  save_top_k: 1
+  mode: max
+  save_last: true
+  dirpath: checkpoints/ConGLUDe
+early_stopping:
+  _target_: pytorch_lightning.callbacks.EarlyStopping
+  monitor: ${monitor}
+  patience: 50
+  mode: max
+lr_monitor:
+  _target_: pytorch_lightning.callbacks.LearningRateMonitor
+  logging_interval: epoch

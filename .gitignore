@@ -1,0 +1,8 @@
+results/
+lightning_logs/
+outputs/
+wandb/
+
+ConGLUDe.egg-info
+*__pycache__
+eval.log

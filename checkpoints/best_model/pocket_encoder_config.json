@@ -1,0 +1,1 @@
+{"act": "selu", "input_dim": 100, "hidden_dim": 1024, "output_dim": 256, "num_layers": 1, "input_dropout": 0.1, "dropout": 0.5, "batch_norm": false}

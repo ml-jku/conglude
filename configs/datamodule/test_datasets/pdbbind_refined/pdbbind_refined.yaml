@@ -1,0 +1,16 @@
+_target_: conglude.datamodule.ConGLUDeDataset
+
+dataset_dir: ./data/datasets/test_datasets/pdbbind_refined
+dataset_name: pdbbind_refined
+task: pp
+structure_based: true
+split: test
+batch_size: 64
+fingerprint_type: null
+load_descriptors: false
+
+# processing options
+extract_ligands: from_file 
+labeled_smiles: none # no smiles files provided
+calc_mol_feats: false # dataset for pocket prediction, no need to calculate ligand features
+load_pocket: true # pockets already pre-calculated, load from file instead of calculating from structure

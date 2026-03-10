@@ -1,0 +1,14 @@
+_target_: conglude.datamodule.ConGLUDeDataset
+
+dataset_dir: ./data/datasets/test_datasets/asd
+dataset_name: asd
+task: pr
+structure_based: true
+split: test
+batch_size: 64
+
+# processing options
+extract_ligands: combined # extract known ligands from csv file plus any additional ligands present in the pdb file
+labeled_smiles: none # ligands extracted from pdb file
+multi_ligand: true # more than one ligand/binding site possible per target
+

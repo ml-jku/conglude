@@ -1,0 +1,12 @@
+  _target_: conglude.datamodule.DatasetList
+  defaults:
+    - _self_
+    - litpcba: litpcba
+    - dude: dude
+    - kinobeads: kinobeads
+    # - pdbbind_time: pdbbind_time
+    # - posebusters: posebusters
+    # - asd: asd
+    # - coach420: coach420
+    # - holo4k: holo4k
+    # - pdbbind_refined: pdbbind_refined

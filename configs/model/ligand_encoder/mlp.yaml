@@ -1,0 +1,9 @@
+_target_: conglude.modules.mlp.MLPEncoder
+act: gelu
+input_dim: 2258
+num_layers: 2
+hidden_dim: 512
+output_dim: 512
+input_dropout: 0.1
+dropout: 0.5
+batch_norm: false

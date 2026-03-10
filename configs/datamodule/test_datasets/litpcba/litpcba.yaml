@@ -1,0 +1,11 @@
+_target_: conglude.datamodule.ConGLUDeDataset
+
+dataset_dir: ./data/datasets/test_datasets/litpcba
+dataset_name: litpcba
+task: vs
+structure_based: false
+split: test
+batch_size: 1
+
+# processing options
+multi_pdb_targets: true # multiple pdb files per target, need dictionary to assign them to targets

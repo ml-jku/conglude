@@ -1,0 +1,7 @@
+_target_: conglude.datamodule.PLDataModule
+defaults:
+  - train_datasets: null
+  - val_datasets: null
+  - test_datasets: test_datasets
+
+num_workers: 64

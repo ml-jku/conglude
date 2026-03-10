@@ -1,0 +1,7 @@
+_target_: conglude.utils.lr_schedulers.PlateauWithWarmup
+_partial_: true
+warmup_steps: 10
+factor: 0.1
+patience: 30
+min_lr: 1e-6
+mode: "max"

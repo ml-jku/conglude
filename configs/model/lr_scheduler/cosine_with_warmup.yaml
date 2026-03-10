@@ -1,0 +1,4 @@
+_target_: conglude.utils.lr_schedulers.CosineWithWarmup
+_partial_: true
+warmup_steps: 10
+total_steps: ${max_epochs}
