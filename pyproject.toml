@@ -4,20 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ConGLUDe"
-version = "0.1.0"
+version = "0.2.0"
 description = ""
 authors = [
     {name = "Lisa Schneckenreiter", email = "schneckenreiter@ml.jku.at"}
 ]
 readme = "README.md"
-license = { text = "MIT" }
-requires-python = ">=3.9,<3.10"
+license = { text = "GNU General Public License v3.0" }
+requires-python = ">=3.11"
 
 dependencies = [
-    "numpy==1.23.5",
-    "scipy==1.10.1",
-    "pandas==2.1.4",
-    "pytorch-lightning==2.5.3",
+    "numpy>=1.26.0,<2.0",
+    "scipy==1.13.0",
+    "pandas==2.2.0",
+    "pytorch-lightning>=2.5.3",
     "biopython==1.85",
     "lmdb==1.6.2",
     "einops==0.8.1",
@@ -29,9 +29,10 @@ dependencies = [
     "wandb==0.21.1",
     "lifelines==0.30.0",
     "bottleneck==1.4.2",
-]
+    "joblib==1.5.3",
+    "scikit-learn==1.8.0",
+    ]
 
 
-[tool.setuptools]
-packages = ["conglude"]
-include-package-data = true
+[tool.setuptools.packages.find]
+include = ["conglude*"]

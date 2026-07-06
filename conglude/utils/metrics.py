@@ -5,7 +5,7 @@ from torchmetrics import Metric, JaccardIndex
 from rdkit.ML.Scoring.Scoring import CalcBEDROC
 from torchmetrics.functional import average_precision, auroc
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from torch import Tensor
 
 
@@ -73,6 +73,7 @@ class VirtualScreeningMetrics(Metric):
         calc_bedroc: bool = True,
         calc_ef: bool = True,
         ef_fractions: List[float] = [0.005, 0.01, 0.05],
+        save_per_target_csv: bool = False,
     ) -> None:
 
         # Disable synchronization at each step; sync happens on compute()
@@ -82,18 +83,22 @@ class VirtualScreeningMetrics(Metric):
         self.calc_bedroc = calc_bedroc
         self.calc_ef = calc_ef
         self.ef_fractions = ef_fractions
+        self.save_per_target_csv = save_per_target_csv
 
         if self.calc_auc:
             self.add_state("auc", default=torch.tensor(0.0, dtype=torch.float32), dist_reduce_fx="sum")
 
         if self.calc_bedroc:
             self.add_state("bedroc", default=torch.tensor(0.0, dtype=torch.float32), dist_reduce_fx="sum")
-        
+
         if self.calc_ef:
             for fraction in ef_fractions:
                 self.add_state(f"ef_{fraction}", default=torch.tensor(0.0, dtype=torch.float32), dist_reduce_fx="sum")
 
         self.add_state("total", default=torch.tensor(0.0, dtype=torch.float32), dist_reduce_fx="sum")
+
+        if self.save_per_target_csv:
+            self._per_target_records: List[Dict] = []
 
     
     def update(
@@ -101,6 +106,7 @@ class VirtualScreeningMetrics(Metric):
         preds: Tensor,
         targets: Tensor,
         indexes: Tensor,
+        protein_names: Optional[List[str]] = None,
     ) -> None:
         """
         Update metric state with a batch of predictions.
@@ -108,7 +114,9 @@ class VirtualScreeningMetrics(Metric):
         Args:
             preds (Tensor): predicted scores
             targets (Tensor): binary activity labels
-            indexes (Tensor): group identifiers (per target protein
+            indexes (Tensor): group identifiers (per target protein)
+            protein_names (Optional[List[str]]): one name per unique protein in indexes.
+                If provided and save_per_target_csv is True, names are used in the CSV.
         """
 
         # Ensure shapes are consistent
@@ -118,7 +126,14 @@ class VirtualScreeningMetrics(Metric):
         targets = torch.flatten(targets)
         indexes = torch.flatten(indexes)
 
-        for i in indexes.unique():
+        unique_indexes = indexes.unique()
+
+        if protein_names is not None:
+            assert len(protein_names) == len(unique_indexes), (
+                f"Length of protein_names ({len(protein_names)}) must match number of unique indexes ({len(unique_indexes)})."
+            )
+
+        for enum_idx, i in enumerate(unique_indexes):
 
             mask = (indexes == i)
             self.total += 1
@@ -131,9 +146,16 @@ class VirtualScreeningMetrics(Metric):
             y_score = y_score[shuffle_idx]
             y_true = y_true[shuffle_idx]
 
+            if self.save_per_target_csv:
+                protein_id = protein_names[enum_idx] if protein_names is not None else i.item()
+                protein_record: Dict = {"protein": protein_id}
+
             if self.calc_auc:
                 auc = auroc(y_score, y_true, task="binary")
                 self.auc+=auc
+
+                if self.save_per_target_csv:
+                    protein_record["auc"] = auc.item()
 
             if self.calc_bedroc:
                 scores_targets = torch.cat((torch.unsqueeze(y_score, axis=1), torch.unsqueeze(y_true, axis=1)), axis=1)
@@ -141,15 +163,46 @@ class VirtualScreeningMetrics(Metric):
 
                 bedroc = CalcBEDROC(scores_targets, 1, 80.5)
                 self.bedroc+=bedroc
-            
+
+                if self.save_per_target_csv:
+                    protein_record["bedroc"] = bedroc if isinstance(bedroc, float) else bedroc.item()
+
             if self.calc_ef:
-                for i, fraction in enumerate(self.ef_fractions):
+                for j, fraction in enumerate(self.ef_fractions):
                     ef = enrichment_factor(y_true, y_score, fraction)
                     setattr(self, f"ef_{fraction}", getattr(self, f"ef_{fraction}") + torch.tensor(ef, dtype=torch.float32))
 
+                    if self.save_per_target_csv:
+                        protein_record[f"ef_{fraction}"] = ef
+
+            if self.save_per_target_csv:
+                self._per_target_records.append(protein_record)
+
+
+    def _write_per_target_csv(self, metrics_path) -> None:
+        """Write per-protein metrics to a CSV file."""
+        import csv
+        import os
+
+        os.makedirs(os.path.dirname(metrics_path) or ".", exist_ok=True)
+
+        fieldnames = list(self._per_target_records[0].keys())
+        with open(f"{metrics_path}/metrics.csv", "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(self._per_target_records)
+
+
+    def reset(self) -> None:
+        """Reset all metric states, including the per-protein records."""
+        super().reset()
+        if self.save_per_target_csv:
+            self._per_target_records = []
+
 
     def compute(
-        self
+        self,
+        metrics_path=None
     ) -> Dict[str, float]:
         """
         Compute average metrics over all groups.
@@ -166,6 +219,9 @@ class VirtualScreeningMetrics(Metric):
         if self.calc_ef:
             for fraction in self.ef_fractions:
                 results[f"ef_{fraction}"] = getattr(self, f"ef_{fraction}").item()/self.total.item()
+
+        if self.save_per_target_csv and self._per_target_records and metrics_path is not None:
+            self._write_per_target_csv(metrics_path=metrics_path)
 
         return results
 
@@ -188,15 +244,17 @@ class TargetFishingMetrics(Metric):
         calc_auprc: bool = True,
         calc_ef: bool = True,
         ef_fractions: List[float] = [0.05, 0.01, 0.005],
+        save_per_target_csv: bool = False,
     ) -> None:
-        
+
         # Disable synchronization at each step; sync happens on compute()
         super().__init__(dist_sync_on_step=False)
 
         self.calc_auc = calc_auc
         self.calc_auprc = calc_auprc
         self.calc_ef = calc_ef
-        self.ef_fractions = ef_fractions      
+        self.ef_fractions = ef_fractions
+        self.save_per_target_csv = save_per_target_csv
 
         # Accumulated data
         self.add_state("scores", default=torch.empty(0, dtype=torch.float32), dist_reduce_fx=None)
@@ -232,9 +290,7 @@ class TargetFishingMetrics(Metric):
         self.mol_inds = torch.cat([self.mol_inds, mol_inds])
 
 
-    def compute(
-        self
-    ) -> Dict[str, float]:
+    def compute(self, metrics_path=None) -> Dict[str, float]:
         """
         Compute target fishing metrics averaged across molecules.
         """
@@ -247,7 +303,7 @@ class TargetFishingMetrics(Metric):
         results = {}
 
         # Group by molecule (query)
-        _, inverse = torch.unique(
+        unique_mols, inverse = torch.unique(
             self.mol_inds, return_inverse=True
         )
 
@@ -268,8 +324,9 @@ class TargetFishingMetrics(Metric):
         ef_sum = torch.zeros(len(self.ef_fractions), device=self.scores.device)
 
         n_mols = 0
+        per_mol_records = []
 
-        for y_score, y_true in zip(score_groups, label_groups):
+        for mol_idx, (y_score, y_true) in enumerate(zip(score_groups, label_groups)):
 
             n = y_true.numel()
             n_pos = y_true.sum().item()
@@ -280,21 +337,34 @@ class TargetFishingMetrics(Metric):
 
             pos_rate = n_pos / n
 
+            record = {"molecule": unique_mols[mol_idx].item()} if self.save_per_target_csv else None
+
             # Compute AUPRC
             if self.calc_auprc:
                 auprc = average_precision(y_score, y_true, task="binary")
                 auprc_sum += auprc
                 delta_auprc_sum += auprc - pos_rate
+                if record is not None:
+                    record["auprc"] = auprc.item() if torch.is_tensor(auprc) else auprc
+                    record["delta_auprc"] = (auprc - pos_rate).item() if torch.is_tensor(auprc) else auprc - pos_rate
 
             # Compute AUC
             if self.calc_auc:
-                auc_sum += auroc(y_score, y_true, task="binary")
+                auc = auroc(y_score, y_true, task="binary")
+                auc_sum += auc
+                if record is not None:
+                    record["auc"] = auc.item() if torch.is_tensor(auc) else auc
 
             # Enrichment factors
             if self.calc_ef:
                 for i, fraction in enumerate(self.ef_fractions):
                     ef = enrichment_factor(y_true, y_score, fraction)
                     ef_sum[i] += ef
+                    if record is not None:
+                        record[f"ef_{fraction}"] = ef
+
+            if record is not None:
+                per_mol_records.append(record)
 
             n_mols += 1
 
@@ -310,7 +380,21 @@ class TargetFishingMetrics(Metric):
             for i, fraction in enumerate(self.ef_fractions):
                 results[f"ef_{fraction}"] = ef_sum[i].item() / n_mols
 
+        if self.save_per_target_csv and per_mol_records and metrics_path is not None:
+            self._write_per_target_csv(per_mol_records, metrics_path)
+
         return results
+
+    def _write_per_target_csv(self, records, metrics_path) -> None:
+        import csv
+        import os
+
+        os.makedirs(metrics_path, exist_ok=True)
+        fieldnames = list(records[0].keys())
+        with open(os.path.join(metrics_path, "metrics.csv"), "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(records)
 
 
 
@@ -337,16 +421,17 @@ class PocketPredictionMetrics(Metric):
     """
 
     def __init__(
-        self, 
+        self,
         calc_dcc=True,
         calc_dcc_ranked=True,
         calc_dca=True,
         calc_dca_ranked=True,
         calc_iou=True,
         threshold=4,
-        rank_descending=True
+        rank_descending=True,
+        **kwargs,
     ) -> None:
-        
+
         # Disable synchronization at each step; sync happens on compute()
         super().__init__(dist_sync_on_step=False)
 
@@ -368,7 +453,7 @@ class PocketPredictionMetrics(Metric):
 
         if self.calc_dca:
             self.add_state("dca", default=torch.tensor(0), dist_reduce_fx="sum")
-        
+
         if self.calc_dca_ranked:
             self.add_state("dca_ranked", default=torch.tensor(0), dist_reduce_fx="sum")
 
@@ -500,7 +585,10 @@ class PocketPredictionMetrics(Metric):
 
         # Identify ligand atoms close to any pocket
         atom_close = (dists < self.threshold).any(dim=1)  # (N_ligand_atoms,)
-        
+
+        if ligand_inds.numel() == 0:
+            return 0
+
         # Construct unique ligand IDs across batch items
         pair_ids = ligand_batch_index * ligand_inds.max().add(1) + ligand_inds
 
@@ -565,18 +653,19 @@ class PocketPredictionMetrics(Metric):
     
 
     def update(
-        self, 
-        pocket_pos_clustered: Tensor, 
-        confidence_clustered: Tensor, 
+        self,
+        pocket_pos_clustered: Tensor,
+        confidence_clustered: Tensor,
         pocket_batch_idx: Tensor,
-        pocket_centers: Tensor, 
-        pocket_center_batch_idx: Tensor, 
-        pocket_counts: Tensor, 
-        ligand_coords: Tensor, 
-        ligand_batch_index: Tensor, 
-        ligand_inds:  Tensor, 
-        pred_segm: Tensor, 
-        y_segm: Tensor, 
+        pocket_centers: Tensor,
+        pocket_center_batch_idx: Tensor,
+        pocket_counts: Tensor,
+        ligand_coords: Tensor,
+        ligand_batch_index: Tensor,
+        ligand_inds: Tensor,
+        pred_segm: Tensor,
+        y_segm: Tensor,
+        **kwargs,
     ) -> None:
         """
         Update pocket prediction metrics for a batch.
@@ -607,20 +696,18 @@ class PocketPredictionMetrics(Metric):
 
         if self.calc_dca:
             self.dca += self.update_dca(pocket_pos_clustered, pocket_batch_idx, ligand_coords, ligand_batch_index, ligand_inds)
-        
+
         if self.calc_dca_ranked:
             self.dca_ranked += self.update_dca_ranked(pocket_pos_clustered, confidence_clustered, pocket_batch_idx, ligand_coords, ligand_batch_index, ligand_inds, pocket_counts)
-        
+
         if self.calc_iou:
             self.iou.update(pred_segm, y_segm)
 
         # Accumulate number of evaluated batch items (for averaging)
-        self.total += len(pocket_batch_idx)
+        self.total += len(pocket_center_batch_idx)
 
 
-    def compute(
-        self
-    ) -> Dict[str, float]:
+    def compute(self, metrics_path=None) -> Dict[str, float]:
         """
         Compute pocket prediction metrics averaged across proteins.
         """
@@ -644,7 +731,6 @@ class PocketPredictionMetrics(Metric):
             self.iou.reset()
 
         return results
-        
 
 
 class PocketRankingMetrics(Metric):
@@ -667,9 +753,10 @@ class PocketRankingMetrics(Metric):
     """
 
     def __init__(
-        self, 
-        threshold: float = 4.0, 
-        wilson_z: float = 1.96
+        self,
+        threshold: float = 4.0,
+        wilson_z: float = 1.96,
+        **kwargs,
     ) -> None:
 
         # Disable synchronization at each step; sync happens on compute()
@@ -691,7 +778,7 @@ class PocketRankingMetrics(Metric):
 
     
     def update(
-        self, 
+        self,
         pocket_pos_clustered: Tensor,
         confidence_clustered: Tensor,
         pocket_batch_idx: Tensor,
@@ -700,6 +787,7 @@ class PocketRankingMetrics(Metric):
         mol_inds: Tensor,
         pocket_centers: Tensor,
         pocket_center_batch_idx: Tensor,
+        **kwargs,
     ) -> None:
         """
         Update ranking-based pocket metrics for a batch.
@@ -723,7 +811,7 @@ class PocketRankingMetrics(Metric):
 
         # Iterate over proteins
         for i in pocket_batch_idx.unique():
-            
+
             # Predicted pockets for this protein
             pocket_pos_i = pocket_pos_clustered[pocket_batch_idx == i]
             confidence_i = confidence_clustered[pocket_batch_idx == i]
@@ -735,21 +823,26 @@ class PocketRankingMetrics(Metric):
             # Ground-truth pocket centers for this protein
             pocket_centers_i = pocket_centers[pocket_center_batch_idx == i]
 
+            n_ligands = 0
+            protein_success_rank = 0
+            protein_success_conf = 0
+
             # Iterate over molecules bound to this protein
             for j in mol_inds_i.unique():
-                
+
                 # Pocket ranking predictions for this protein–ligand pair
                 pocket_preds_ij = pocket_preds_i[mol_inds_i == j][0]
-                
+
                 # Top-ranked pocket evaluation
                 top_rank = torch.argmax(pocket_preds_ij)
                 selected_pocket_rank = pocket_pos_i[top_rank]
 
                 # Distance to closest ground-truth pocket
-                d_rank = torch.norm(pocket_centers_i[mol_inds_i == j] - selected_pocket_rank, dim=1).min()  # min distance
+                d_rank = torch.norm(pocket_centers_i[mol_inds_i == j] - selected_pocket_rank, dim=1).min()
 
                 if d_rank <= self.threshold:
                     self.success_rank += 1
+                    protein_success_rank += 1
 
                 # Top-confidence pocket evaluation
                 top_conf = torch.argmax(confidence_i)
@@ -758,9 +851,11 @@ class PocketRankingMetrics(Metric):
 
                 if d_conf <= self.threshold:
                     self.success_conf += 1
+                    protein_success_conf += 1
 
                 # Count evaluated protein–ligand pair
                 self.total += 1
+                n_ligands += 1
 
             # Track statistics for average pocket count
             self.num_pockets += len(pocket_pos_i)
@@ -795,9 +890,7 @@ class PocketRankingMetrics(Metric):
         return (center - margin, center + margin)
 
 
-    def compute(
-        self
-    ) -> Dict[str, float]:
+    def compute(self, metrics_path=None) -> Dict[str, float]:
         """
         Compute pocket ranking metrics averaged across protein-ligand pairs.
         """

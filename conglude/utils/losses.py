@@ -240,13 +240,13 @@ class BCELoss(nn.Module):
         """
 
         # Default positives on diagonal
-        if labels is None: 
+        if labels is None:
             labels = torch.eye(preds.size(0), device=preds.device)
 
         # Affine logit transform
         logits = (preds + self.shift) * self.scaling
 
-        loss = self.bce_loss(logits, labels)
+        loss = self.bce_loss(logits, labels.float())
 
         if group_indices is None: 
             return loss.mean()

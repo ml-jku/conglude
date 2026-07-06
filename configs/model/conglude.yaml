@@ -51,5 +51,7 @@ checkpoint_path: ./checkpoints
 
 num_pocket_nodes: 8
 protein_node: true
-save_predictions: false
+save_predictions: true
 save_embeddings: false
+save_metrics: true
+save_pymol_visualizations: false

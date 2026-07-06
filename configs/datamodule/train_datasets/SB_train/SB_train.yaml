@@ -1,0 +1,10 @@
+_target_: conglude.datamodule.ConGLUDeDataset
+
+dataset_dir: ./data/datasets/train_val_datasets/SB_train_val
+dataset_name: SB_train
+task: ${task}
+structure_based: true
+split: train
+
+batch_size: 64
+debug: ${debug}

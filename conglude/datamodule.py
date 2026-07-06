@@ -100,7 +100,7 @@ class ConGLUDeDataset(Dataset):
     def __init__(
         self,
         dataset_dir: str,
-        dataset_name: str,
+        dataset_name: str = None,
 
         task: str = "all",
         structure_based: bool = False,
@@ -122,7 +122,7 @@ class ConGLUDeDataset(Dataset):
         batch_size: int = 16,        
         debug: bool = False,
 
-        pdb_dir: str = "./data/pdb_files",
+        pdb_dir: str = None,
         overwrite: bool = False,
         num_workers: int = 64,
         extract_ligands: str = "none",
@@ -135,6 +135,9 @@ class ConGLUDeDataset(Dataset):
         load_pocket: bool = False,
         save_cleaned_pdbs: bool = False,
         save_complex_info: bool = False,
+        standardize_input_smiles: bool = False,
+
+        results_dir: str = None,
 
         ecfp_radius: int = 2,
         fp_length: int = 2048,
@@ -142,21 +145,37 @@ class ConGLUDeDataset(Dataset):
         save_scaler: bool = False,
     ) -> None:
         
+        if dataset_name is None:
+            dataset_name = os.path.basename(os.path.normpath(dataset_dir))
+
+        self.split = split
+
         # Prefix used for train/val splits
-        if split in ["train", "val"]:
+        if split in ["train", "val"] and task != "all":
             self.prefix = f"{task}_{split}_"
+        elif split in ["train", "val"] and task == "all":
+            self.prefix = f"{split}_"
         else:
             self.prefix = ""
-        
+
         print(f"Initializing dataset {self.prefix}{dataset_name}.")
 
         super().__init__()
-        
+
         # Basic dataset configuration
         self.dataset_dir = dataset_dir
         self.dataset_name = dataset_name
         self.task = task
         self.structure_based = structure_based
+        self.results_dir = results_dir or dataset_dir
+
+        if dataset_dir.startswith("./data/") or dataset_dir.startswith("data/"):
+            self.data_dir = dataset_dir
+        else:
+            self.data_dir = os.path.join(dataset_dir, "ConGLUDe", "data")
+
+        if pdb_dir is None:
+            pdb_dir = os.path.join(self.data_dir, "raw", "pdb_files")
 
         # Protein graph configuration
         self.multi_pdb_targets = multi_pdb_targets
@@ -182,8 +201,9 @@ class ConGLUDeDataset(Dataset):
         
         # Process proteins if missing
         if not os.path.isfile(self.processed_ids_path) or not os.path.isfile(self.task_ids_path) or not os.path.isdir(self.graph_dir):
+
             graph_processor = PDBGraphProcessor(
-                    dataset_dir=dataset_dir,
+                    dataset_dir=self.data_dir,
                     pdb_dir=pdb_dir,
                     overwrite=overwrite,
                     num_workers=num_workers,
@@ -198,7 +218,8 @@ class ConGLUDeDataset(Dataset):
                     max_num_subunits=max_num_subunits,
                     load_pocket=load_pocket,
                     save_cleaned_pdbs=save_cleaned_pdbs,
-                    save_complex_info=save_complex_info
+                    save_complex_info=save_complex_info,
+                    standardize_input_smiles=standardize_input_smiles
                     )
             graph_processor.process()
 
@@ -210,7 +231,7 @@ class ConGLUDeDataset(Dataset):
             if not os.path.isfile(self.fingerprint_path) or not os.path.isfile(self.descriptor_path) or (not os.path.isfile(self.ligand_metadata_path) and self.memmap):
                 
                 ligand_processor = LigandProcessor(
-                    dataset_dir=dataset_dir,
+                    dataset_dir=self.data_dir,
                     ecfp_radius=ecfp_radius,
                     fp_length=fp_length,
                     calc_descriptors=load_descriptors,
@@ -225,10 +246,10 @@ class ConGLUDeDataset(Dataset):
             self.ligand_features = self.load_ligand_data()
 
         # Get counter for number of pockets per PDB entry
-        self.pocket_counter = Counter([file_name.split("_")[0] for file_name in self.graph_files])
+        self.pocket_counter = Counter([file_name.replace(".pt", "").split("_")[0] for file_name in self.graph_files])
 
         if self.multi_pdb_targets:
-            self.target2pdb_dict = read_json(os.path.join(self.dataset_dir, "info", "target2pdb.json"))
+            self.target2pdb_dict = read_json(os.path.join(self.data_dir, "info", "target2pdb.json"))
             self.targets = list(self.target2pdb_dict.keys())
 
     
@@ -258,21 +279,20 @@ class ConGLUDeDataset(Dataset):
                 Path to stored molecular descriptors.
         """
 
-        processed_ids_path = os.path.join(self.dataset_dir, "info", "processed_protein_ids.txt")
-        task_ids_path = os.path.join(self.dataset_dir, "info", f"{self.prefix}protein_ids.txt")
-        excluded_ids_path = os.path.join(self.dataset_dir, "info", "excluded_protein_ids.txt")
+        processed_ids_path = os.path.join(self.data_dir, "info", "processed_protein_ids.txt")
+        task_ids_path = os.path.join(self.data_dir, "info", f"{self.prefix}protein_ids.txt")
+        excluded_ids_path = os.path.join(self.data_dir, "info", "excluded_protein_ids.txt")
 
-        graph_dir = os.path.join(self.dataset_dir, "processed", "graphs", f"{self.max_neighbors}_neighbors_{self.neighbor_dist_cutoff}_cutoff")
+        graph_dir = os.path.join(self.data_dir, "processed", "graphs", f"{self.max_neighbors}_neighbors_{self.neighbor_dist_cutoff}_cutoff")
 
-        ligand_metadata_path = os.path.join(self.dataset_dir, "processed", "ligand_embeddings", f"metadata_{self.fingerprint_type}.json")
+        ligand_metadata_path = os.path.join(self.data_dir, "processed", "ligand_embeddings", f"metadata_{self.fingerprint_type}.json")
 
-        # Switch between memmap and torch storage
         if self.memmap:
-            fingerprint_path = os.path.join(self.dataset_dir, "processed", "ligand_embeddings", f"{self.fingerprint_type}.dat")
-            descriptor_path  = os.path.join(self.dataset_dir, "processed", "ligand_embeddings", f"descriptors.dat")
+            fingerprint_path = os.path.join(self.data_dir, "processed", "ligand_embeddings", f"{self.fingerprint_type}.dat")
+            descriptor_path  = os.path.join(self.data_dir, "processed", "ligand_embeddings", f"descriptors.dat")
         else:
-            fingerprint_path = os.path.join(self.dataset_dir, "processed", "ligand_embeddings", f"{self.fingerprint_type}.pt")
-            descriptor_path = os.path.join(self.dataset_dir, "processed", "ligand_embeddings", f"descriptors.pt")
+            fingerprint_path = os.path.join(self.data_dir, "processed", "ligand_embeddings", f"{self.fingerprint_type}.pt")
+            descriptor_path = os.path.join(self.data_dir, "processed", "ligand_embeddings", f"descriptors.pt")
 
         return processed_ids_path, task_ids_path, excluded_ids_path, graph_dir, ligand_metadata_path, fingerprint_path, descriptor_path
 
@@ -324,18 +344,17 @@ class ConGLUDeDataset(Dataset):
 
         if self.memmap:
             ligand_metadata = read_json(self.ligand_metadata_path)
+            dtype = ligand_metadata.get("precision", "float32")
 
-        # Load fingerprints
         if self.fingerprint_type is not None:
             if self.memmap:
-                fingerprints = np.memmap(self.fingerprint_path, dtype="float32", mode="r", shape=(ligand_metadata["num_ligands"], ligand_metadata["fingerprint_length"]))
+                fingerprints = np.memmap(self.fingerprint_path, dtype=dtype, mode="r", shape=(ligand_metadata["num_ligands"], ligand_metadata["fingerprint_length"]))
             else:
                 fingerprints = torch.load(self.fingerprint_path).to(dtype=torch.float32)
 
-        # Load descriptors
         if self.load_descriptors:
             if self.memmap:
-                descriptors = np.memmap(self.descriptor_path, dtype="float32", mode="r", shape=(ligand_metadata["num_ligands"], ligand_metadata["descriptor_length"]))
+                descriptors = np.memmap(self.descriptor_path, dtype=dtype, mode="r", shape=(ligand_metadata["num_ligands"], ligand_metadata["descriptor_length"]))
             else:
                 descriptors = torch.load(self.descriptor_path).to(dtype=torch.float32)
 
@@ -470,7 +489,7 @@ class ConGLUDeDataset(Dataset):
                 sampled_inactive_inds = random.sample(inactive_inds, n_inactives)
 
                 ligand_idx = np.array(sampled_active_inds + sampled_inactive_inds)
-                labels = torch.cat([torch.ones(len(sampled_active_inds)), torch.zeros(len(sampled_inactive_inds))]).lon()
+                labels = torch.cat([torch.ones(len(sampled_active_inds)), torch.zeros(len(sampled_inactive_inds))]).long()
 
             # Load ligand features
             if self.memmap:
@@ -634,7 +653,7 @@ class MixedDataset(IterableDataset):
         )
 
         # Combine pocket counters of both datasets
-        self.pocket_counter = LB_dataset.pocket_counter + SB_dataset.pocket_counter
+        self.pocket_counter = {"SB_train": SB_dataset.pocket_counter, "LB_train": LB_dataset.pocket_counter}
 
 
     def __iter__(
@@ -791,7 +810,7 @@ class PLDataModule(pl.LightningDataModule):
         train_datasets: list = None,
         val_datasets: list = None,
         test_datasets: list = None,
-        num_workers: int = 16,
+        num_workers: int = 0,
     ) -> None:
         
         super().__init__()
@@ -827,20 +846,21 @@ class PLDataModule(pl.LightningDataModule):
         elif len(self.train_datasets) == 2:
 
             # Ensure correct dataset naming
-            assert set([dataset.name for dataset in self.train_datasets]) == {"SB_train", "LB_train"}, "For mixed training, datasets have to be names 'SB_train' and 'LB_train'"
-            
+            assert set([dataset.dataset_name for dataset in self.train_datasets]) == {"SB_train", "LB_train"}, "For mixed training, datasets have to be named 'SB_train' and 'LB_train'"
+
             # Separate SB and LB datasets
             for train_dataset in self.train_datasets:
-                if train_dataset.name == "SB_train":
+                if train_dataset.dataset_name == "SB_train":
                     train_SB_dataset = train_dataset
                     SB_batch_size = train_dataset.batch_size
-                elif train_dataset.name == "LB_train":
+                elif train_dataset.dataset_name == "LB_train":
                     train_LB_dataset = train_dataset
                     LB_batch_size = train_dataset.batch_size
 
             # Create mixed dataset (already yields full batches)
             p_LB = np.ceil(len(train_LB_dataset)/LB_batch_size)/(np.ceil(len(train_LB_dataset)/LB_batch_size) + np.ceil(len(train_SB_dataset)/SB_batch_size))
             mixed_dataset = MixedDataset(train_LB_dataset, train_SB_dataset, LB_batch_size, SB_batch_size, LB_collate_fn=custom_collate, SB_collate_fn=custom_collate, p_LB=p_LB, num_workers=self.num_workers, shuffle=True)
+            mixed_dataset.dataset_name = "mixed_train"
 
             return DataLoader(mixed_dataset, batch_size=None)  # batch_size=None because MixedDataset already returns batches
         

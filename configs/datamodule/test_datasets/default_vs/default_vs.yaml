@@ -1,0 +1,9 @@
+_target_: conglude.datamodule.ConGLUDeDataset
+
+dataset_dir: ./data/datasets/test_datasets/vs_eval
+task: vs
+structure_based: false
+split: test
+batch_size: 4
+labeled_smiles: binary
+standardize_input_smiles: false

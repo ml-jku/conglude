@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_scatter import scatter_max
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import EarlyStopping
 import pandas as pd
 import numpy as np
 from itertools import groupby
@@ -18,6 +19,7 @@ from conglude.utils.losses import VNPositionHuberLoss, DiceLoss, ConfidenceLoss,
 from conglude.utils.metrics import VirtualScreeningMetrics, TargetFishingMetrics, PocketPredictionMetrics, PocketRankingMetrics
 from conglude.utils.lr_schedulers import PlateauWithWarmup, CosineWithWarmup
 from conglude.utils.common import write_list_to_txt
+from conglude.utils.visualization import build_pymol_scene_script, create_pymol_scene
 from conglude.modules.vnegnn import VNEGNN
 from conglude.modules.mlp import MLPEncoder
 from conglude.modules.cluster import DBSCANCluster
@@ -71,6 +73,8 @@ class ConGLUDeModel(pl.LightningModule):
         If True, prediction outputs are saved during testing.
     save_embeddings: bool
         If True, learned embeddings are stored during testing.
+    save_metrics: bool
+        If True, virtual screening metrics per protein are stored during testing.
     """
     
     def __init__(
@@ -105,6 +109,8 @@ class ConGLUDeModel(pl.LightningModule):
         protein_node: bool = True,
         save_predictions: bool = False,
         save_embeddings: bool = False,
+        save_metrics: bool = False,
+        save_pymol_visualizations: bool = False,
     ):
 
         self.save_hyperparameters(
@@ -129,16 +135,16 @@ class ConGLUDeModel(pl.LightningModule):
        
         self.vnegnn = vnegnn
         if checkpoint_name is not None:
-            # try:
-            vnegnn_state_dict = torch.load(f'{checkpoint_path}/{checkpoint_name}/vnegnn.pth', weights_only=True)
-            self.vnegnn.load_state_dict(vnegnn_state_dict)
-            # except:
-            #     print("Unable to load VN-EGNN weights.")
+            try:
+                vnegnn_state_dict = torch.load(f'{checkpoint_path}/{checkpoint_name}/vnegnn.pth', weights_only=True, map_location=self.device)
+                self.vnegnn.load_state_dict(vnegnn_state_dict)
+            except:
+                print("Unable to load VN-EGNN weights.")
         
         self.ligand_encoder = ligand_encoder
         if checkpoint_name is not None:
             try:
-                ligand_encoder_state_dict = torch.load(f'{checkpoint_path}/{checkpoint_name}/ligand_encoder.pth', weights_only=True)
+                ligand_encoder_state_dict = torch.load(f'{checkpoint_path}/{checkpoint_name}/ligand_encoder.pth', weights_only=True, map_location=self.device)
                 self.ligand_encoder.load_state_dict(ligand_encoder_state_dict)
             except:
                 print("Unable to load ligand encoder weights.")
@@ -146,7 +152,7 @@ class ConGLUDeModel(pl.LightningModule):
         self.pocket_encoder = pocket_encoder
         if checkpoint_name is not None:
             try:
-                pocket_encoder_state_dict = torch.load(f'{checkpoint_path}/{checkpoint_name}/pocket_encoder.pth', weights_only=True)
+                pocket_encoder_state_dict = torch.load(f'{checkpoint_path}/{checkpoint_name}/pocket_encoder.pth', weights_only=True, map_location=self.device)
                 self.pocket_encoder.load_state_dict(pocket_encoder_state_dict)
             except:
                 print("Unable to load pocket encoder weights.")
@@ -154,7 +160,7 @@ class ConGLUDeModel(pl.LightningModule):
         self.protein_encoder = protein_encoder
         if checkpoint_name is not None:
             try:
-                protein_encoder_state_dict = torch.load(f'{checkpoint_path}/{checkpoint_name}/protein_encoder.pth', weights_only=True)
+                protein_encoder_state_dict = torch.load(f'{checkpoint_path}/{checkpoint_name}/protein_encoder.pth', weights_only=True, map_location=self.device)
                 self.protein_encoder.load_state_dict(protein_encoder_state_dict)
             except:
                 print("Unable to load protein encoder weights.")
@@ -185,6 +191,8 @@ class ConGLUDeModel(pl.LightningModule):
         
         self.save_predictions = save_predictions
         self.save_embeddings = save_embeddings
+        self.save_metrics = save_metrics
+        self.save_pymol_visualizations = save_pymol_visualizations
 
         # # Setup pocket counters and metrics for evaluation
         # self.setup()
@@ -214,8 +222,11 @@ class ConGLUDeModel(pl.LightningModule):
 
         if hasattr(dm, "train_dataloader") and dm.train_dataloader() is not None:
             dataset = dm.train_dataloader().dataset
-            pocket_counters[dataset.dataset_name] = dataset.pocket_counter
-
+            if dataset.dataset_name == "mixed_train":
+                pocket_counters["SB_train"] = dataset.pocket_counter["SB_train"]
+                pocket_counters["LB_train"] = dataset.pocket_counter["LB_train"]
+            else:
+                pocket_counters[dataset.dataset_name] = dataset.pocket_counter
         if hasattr(dm, "val_dataloader"):
             for dataloader in dm.val_dataloader():
                 dataset = dataloader.dataset
@@ -244,14 +255,13 @@ class ConGLUDeModel(pl.LightningModule):
         elif isinstance(dm.train_dataloader().dataset, MixedDataset):
             self.metrics = {
                 "SB_train": {
-                    "virtual_screening": VirtualScreeningMetrics(ef_fractions=[0.05], calc_re=False),
-                    "target_fishing": TargetFishingMetrics(),
+                    "virtual_screening": VirtualScreeningMetrics(ef_fractions=[0.05]),
                     "pocket_prediction": PocketPredictionMetrics(calc_iou=False),
                     "pocket_ranking": PocketRankingMetrics(),
                 },
 
                 "LB_train": {
-                    "virtual_screening": VirtualScreeningMetrics(calc_re=False),
+                    "virtual_screening": VirtualScreeningMetrics(),
                 },
             }
 
@@ -259,8 +269,7 @@ class ConGLUDeModel(pl.LightningModule):
         elif dm.train_dataloader().dataset.structure_based:
             self.metrics = {
                 dm.train_dataloader().dataset.dataset_name: {
-                    "virtual_screening": VirtualScreeningMetrics(ef_fractions=[0.05], calc_re=False),
-                    "target_fishing": TargetFishingMetrics(),
+                    "virtual_screening": VirtualScreeningMetrics(ef_fractions=[0.05]),
                     "pocket_prediction": PocketPredictionMetrics(calc_iou=False),
                     "pocket_ranking": PocketRankingMetrics(),
                 }
@@ -268,7 +277,7 @@ class ConGLUDeModel(pl.LightningModule):
         else:
             self.metrics = {
                 dm.train_dataloader().dataset.dataset_name: {
-                    "virtual_screening": VirtualScreeningMetrics(calc_re=False),
+                    "virtual_screening": VirtualScreeningMetrics(),
                 }
             }
 
@@ -278,14 +287,13 @@ class ConGLUDeModel(pl.LightningModule):
             
             if dataloader.dataset.structure_based:
                 self.metrics[name] = {
-                    "virtual_screening": VirtualScreeningMetrics(ef_fractions=[0.05], calc_re=False),
-                    "target_fishing": TargetFishingMetrics(),
+                    "virtual_screening": VirtualScreeningMetrics(ef_fractions=[0.05]),
                     "pocket_prediction": PocketPredictionMetrics(calc_iou=False),
                     "pocket_ranking": PocketRankingMetrics(),
                 }
             else:
                 self.metrics[name] = {
-                    "virtual_screening": VirtualScreeningMetrics(calc_re=False),
+                    "virtual_screening": VirtualScreeningMetrics(),
                 }
 
         # Add metrics for each test dataset based on its task
@@ -293,20 +301,22 @@ class ConGLUDeModel(pl.LightningModule):
             name = dataloader.dataset.dataset_name
             task = dataloader.dataset.task
 
+            save_per_target_csv = self.save_metrics
+
             if task == "vs":
-                self.metrics[name] = {"virtual_screening": VirtualScreeningMetrics()}
+                self.metrics[name] = {"virtual_screening": VirtualScreeningMetrics(save_per_target_csv=save_per_target_csv)}
             elif task == "tf":
-                self.metrics[name] = {"target_fishing": TargetFishingMetrics()}
+                self.metrics[name] = {"target_fishing": TargetFishingMetrics(save_per_target_csv=save_per_target_csv)}
             elif task == "pp":
-                self.metrics[name] = {"pocket_prediction": PocketPredictionMetrics(calc_iou=False)}
+                self.metrics[name] = {"pocket_prediction": PocketPredictionMetrics(calc_iou=False, save_per_target_csv=save_per_target_csv)}
             elif task == "pr":
-                self.metrics[name] = {"pocket_ranking": PocketRankingMetrics()}
+                self.metrics[name] = {"pocket_ranking": PocketRankingMetrics(save_per_target_csv=save_per_target_csv)}
             elif task == "all":
                 self.metrics[name] = {
-                    "virtual_screening": VirtualScreeningMetrics(),
-                    "target_fishing": TargetFishingMetrics(),
-                    "pocket_prediction": PocketPredictionMetrics(calc_iou=False),
-                    "pocket_ranking": PocketRankingMetrics(),
+                    "virtual_screening": VirtualScreeningMetrics(save_per_target_csv=save_per_target_csv),
+                    "target_fishing": TargetFishingMetrics(save_per_target_csv=save_per_target_csv),
+                    "pocket_prediction": PocketPredictionMetrics(calc_iou=False, save_per_target_csv=save_per_target_csv),
+                    "pocket_ranking": PocketRankingMetrics(save_per_target_csv=save_per_target_csv),
                 }
 
 
@@ -565,24 +575,49 @@ class ConGLUDeModel(pl.LightningModule):
             self.log(f"avg_val/{metric_name}", avg_metric_value, sync_dist=True, add_dataloader_idx=False)
 
     
-    def on_test_epoch_end(
-        self
-    ) -> None:
+    def on_test_epoch_end(self) -> None:
         """
-        Compute and log test metrics. 
-        Optionally saves predictions or embeddings.
+        Compute and log test metrics.
+        Optionally saves predictions or embeddings per dataset.
         """
 
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
         test_dataloaders = self.trainer.datamodule.test_dataloader()
 
-        # Compute metrics per test dataloader
         for test_dataloader in test_dataloaders:
-            loader_name = test_dataloader.dataset.dataset_name
-            self.compute_and_log_metrics(loader_name)
+            ds_name = test_dataloader.dataset.dataset_name
+            ds_dir = test_dataloader.dataset.dataset_dir
+            results_dir = self.get_results_dir(timestamp, ds_name, ds_dir)
 
-        # If requested, save predictions or embeddings to disk
-        if self.save_predictions or self.save_embeddings:
-            self.save_results()
+            if self.save_metrics:
+                metrics_path = os.path.join(results_dir, "metrics")
+                os.makedirs(metrics_path, exist_ok=True)
+            else:
+                metrics_path = None
+
+            self.compute_and_log_metrics(ds_name, metrics_path=metrics_path)
+
+            if (self.save_predictions or self.save_embeddings) and ds_name in self._ds:
+                self.save_results(ds_name, results_dir=results_dir)
+
+            if self.save_pymol_visualizations and ds_name in self._ds:
+                self._write_pymol_scenes(ds_name, results_dir)
+
+
+    def get_results_dir(self, timestamp: str, dataset_name: str, dataset_dir: str) -> str:
+        """
+        Resolve the timestamped run directory for a single dataset.
+
+        For repo datasets (dataset_dir under ./data/): results/<dataset_name>/<timestamp>/
+        For external datasets: <dataset_dir>/ConGLUDe/results/<timestamp>/
+        """
+        if dataset_dir.startswith("./data/") or dataset_dir.startswith("data/"):
+            results_dir = os.path.join("results", dataset_name, timestamp)
+        else:
+            results_dir = os.path.join(dataset_dir, "ConGLUDe", "results", timestamp)
+
+        os.makedirs(results_dir, exist_ok=True)
+        return results_dir
 
 
     def forward(
@@ -707,7 +742,7 @@ class ConGLUDeModel(pl.LightningModule):
             output["index"]["pocket_center_batch_idx"] = pocket_center_batch_idx
 
         # Pocket ranking predictions
-        if (dataset_specs["task"] in ["train", "val"] and dataset_specs["structure_based"]) or dataset_specs["task"] in ["pr", "all"]:
+        if (dataset_specs["task"] in ["train", "val"] and dataset_specs["structure_based"]) or dataset_specs["task"] in ["vs", "pr", "all"]:
 
             # Compute ligand–pocket similarity scores
             if self.protein_node:
@@ -808,9 +843,11 @@ class ConGLUDeModel(pl.LightningModule):
 
         # Attach additional data if predictions are to be saved (test mode)
         if dataset_specs["task"] not in ["train", "val"] and self.save_predictions:
-            output["labels"]["vs_labels"] = labels
-            output["index"]["ligand_batch_idx"] = ligand_batch_idx
-            output["index"]["ligand_idx"] = ligand_idx
+            if dataset_specs["task"] in ["vs", "tf", "pr"]:
+                output["index"]["ligand_batch_idx"] = ligand_batch_idx
+                output["index"]["ligand_idx"] = ligand_idx
+            if dataset_specs["task"] in ["vs", "tf"]:
+                output["labels"]["vs_labels"] = labels
 
         if dataset_specs["task"] not in ["train", "val"] and (self.save_predictions or self.save_embeddings):
             output["protein_names"] = proteins.name
@@ -867,6 +904,7 @@ class ConGLUDeModel(pl.LightningModule):
                     ligand_inds = proteins["ligand"].indices,
                     pred_segm = torch.sigmoid(output["predictions"]["residue_segm"]).squeeze(),
                     y_segm  = proteins["residue"].y.int(),
+                    protein_names = proteins.name,
                 )                    
             
             # Derive pocket ranking labels
@@ -894,7 +932,8 @@ class ConGLUDeModel(pl.LightningModule):
                     ligand_batch_idx,
                     ligand_idx,
                     proteins["pocket_center"],
-                    output["index"]["pocket_center_batch_idx"]
+                    output["index"]["pocket_center_batch_idx"],
+                    protein_names=proteins.name,
                 )
                     
             # Calculate molecule-to-protein loss
@@ -921,7 +960,7 @@ class ConGLUDeModel(pl.LightningModule):
             # Calculate virtual screening loss
             if dataset_specs["structure_based"]:
                 assert vs_preds.shape[0] == vs_preds.shape[1]
-                labels = torch.eye(vs_preds.shape[0], device = self.device)
+                labels = torch.eye(vs_preds.shape[0], device = self.device).long()
                 ligand_batch_idx = torch.arange(labels.shape[0]).unsqueeze(1).expand(-1, labels.shape[1])
 
                 # Protein+pocket to molecule loss for structure-based training
@@ -934,7 +973,6 @@ class ConGLUDeModel(pl.LightningModule):
             else:
                 # Ligand-based virtual screening loss
                 if dataset_specs["task"] in ["train", "val"] and self.LB_virtual_screening_loss_weight != 0:
-
                     LB_virtual_screening_loss = self.LB_virtual_screening_loss(vs_preds, labels) # , ligand_batch_idx)
                     loss_dict["LB_virtual_screening_loss"] = LB_virtual_screening_loss
                     
@@ -942,8 +980,10 @@ class ConGLUDeModel(pl.LightningModule):
 
             # Update virtual screening metrics
             if "virtual_screening" in self.metrics[dataset_specs["name"]]:
-
-                self.metrics[dataset_specs["name"]]["virtual_screening"].update(vs_preds, labels, ligand_batch_idx)
+                if dataset_specs["multi_pdb_targets"]:
+                    self.metrics[dataset_specs["name"]]["virtual_screening"].update(vs_preds, labels, ligand_batch_idx, [proteins.name[0]])
+                else:
+                    self.metrics[dataset_specs["name"]]["virtual_screening"].update(vs_preds, labels, ligand_batch_idx, proteins.name)
 
         # Update target fishing metrics in ligand-based setting
         if dataset_specs["structure_based"] == False and "target_fishing" in self.metrics[dataset_specs["name"]]:
@@ -961,268 +1001,335 @@ class ConGLUDeModel(pl.LightningModule):
         # Optionally save test predictions or embeddings
         else:
             if self.save_predictions or self.save_embeddings:
-                self.update_save_lists(output)
+                self.update_save_lists(output, dataset_specs["task"], dataset_specs["name"])
         
         return loss
 
 
-    def initialize_save_tensors(
-        self
-        ) -> None:
+    def initialize_save_tensors(self) -> None:
         """
-        Initialize containers for storing predictions, embeddings, and metadata during testing.
+        Initialize per-dataset containers for storing predictions, embeddings, and metadata during testing.
         """
-        
-        # Initialize lists to store protein and pocket identifiers across batches
-        self.protein_names = []
-        self.pocket_names = []
+        self._ds = {}
+        self._ds_offsets = {}
+        self._ds_tasks = {}
 
-        # Initialize lists for saving test predictions
+    def _init_dataset_containers(self, dataset_name: str, task: str) -> None:
+        """Lazily initialize containers for a dataset on first batch encounter."""
+        d = {"protein_names": [], "pocket_names": []}
+
         if self.save_predictions:
+            if task in ("pp", "pr"):
+                d.update(pocket_pos=[], confidence=[], pocket_batch_idx=[])
+            if task == "pr":
+                d.update(pocket_centers=[], pocket_center_batch_idx=[],
+                         pocket_preds=[], pr_ligand_idx=[], pr_ligand_batch_idx=[])
+            if task in ("vs", "tf"):
+                d.update(vs_preds=[], vs_labels=[], vs_protein_names=[], vs_ligand_idx=[])
 
-            self.pocket_pos = []
-            self.confidence = []
-            self.pocket_batch_idx = []
-            self.pocket_preds = []
-            self.pocket_centers = []
-            self.pocket_center_batch_idx = []
-            self.vs_preds = []
-            self.vs_labels = []
-            self.ligand_batch_idx = []
-            self.ligand_idx = []
-
-        # Initialize lists for saving test embeddings
         if self.save_embeddings:
-
-            self.pocket_embeddings = []
+            d["pocket_embeddings"] = []
             if self.protein_node:
-                self.protein_embeddings = []
-                self.ligand_embeddings_p = []
-            self.ligand_embeddings_b = []
+                d.update(protein_embeddings=[], ligand_embeddings_p=[])
+            d["ligand_embeddings_b"] = []
 
-        # Running offset for batch indices
-        self.batch_offset = 0
+        self._ds[dataset_name] = d
+        self._ds_offsets[dataset_name] = 0
+        self._ds_tasks[dataset_name] = task
 
 
     def update_save_lists(
-        self, 
-        output: dict
+        self,
+        output: dict,
+        task: str,
+        dataset_name: str,
     ) -> None:
-
         """
-        Accumulate batch-wise outputs into lists.
+        Accumulate batch-wise outputs into per-dataset containers.
 
         Parameters
         ----------
         output: dict
-            Dictionary returned by `forward(...)` and `process_step(...)`. 
+            Dictionary returned by `forward(...)` and `process_step(...)`.
+        task: str
+            Dataset task type ("pp", "pr", "vs", "tf").
+        dataset_name: str
+            Name of the dataset this batch belongs to.
         """
 
-        def append_if_exists(
-            container: list, 
-            dictionary: dict, 
-            key: str, detach: 
-            bool = True
-        ) -> None:
-            """
-            Append a value from a dictionary to a list if the key exists.
+        if dataset_name not in self._ds:
+            self._init_dataset_containers(dataset_name, task)
 
-            Parameters
-            ----------
-            container: list
-                Target list to append the value to.
-            dictionary: dict
-                Dictionary potentially containing the value.
-            key: str
-                Key to look up in the dictionary.
-            detach: bool
-                If True and the value is a torch.Tensor, it is detached from the computation graph before storing.
-            """
-            
-            if key in dictionary:
-                x = dictionary[key]
+        ds = self._ds[dataset_name]
 
-            # Detach tensors to avoid storing computation graphs
+        def append_if_exists(container, dictionary, key, detach=True):
+            if key not in dictionary:
+                return
+            x = dictionary[key]
             if detach and torch.is_tensor(x):
                 x = x.detach()
-
             container.append(x)
-        
-        # Save protein names
-        self.protein_names.extend(output["protein_names"])
-       
-        # Generate pocket names of the form: "<protein_name>_pocket_<running_index>"
-        self.pocket_names.extend([f"{output['protein_names'][j]}_pocket_{k}" for j, protein in groupby(output["vnegnn_predictions"]["pocket_batch_idx"]) for k, _ in enumerate(protein, start=1)])
-        
-        # Save predictions and indices (if enabled)
+
+        offset = self._ds_offsets[dataset_name]
+
+        if task in ("pp", "pr") or self.save_embeddings:
+            ds["protein_names"].extend(output["protein_names"])
+            ds["pocket_names"].extend([f"{output['protein_names'][j]}_pocket_{k}" for j, protein in groupby(output["index"]["pocket_batch_idx"].cpu().tolist()) for k, _ in enumerate(protein, start=1)])
+
         if self.save_predictions:
-            append_if_exists(self.pocket_pos, output["predictions"], "pocket_pos_clustered")
-            append_if_exists(self.confidence, output["predictions"], "confidence_clustered")
 
-            if "pocket_batch_idx" in output["index"]:
-                self.pocket_batch_idx.append(output["index"]["pocket_batch_idx"].detach() + self.batch_offset)
+            if task in ("pp", "pr"):
+                append_if_exists(ds["pocket_pos"], output["predictions"], "pocket_pos_clustered")
+                append_if_exists(ds["confidence"], output["predictions"], "confidence_clustered")
 
-            append_if_exists(self.pocket_preds, output["predictions"], "pocket_preds")
-            append_if_exists(self.pocket_centers, output["labels"], "pocket_centers")
+                if "pocket_batch_idx" in output["index"]:
+                    ds["pocket_batch_idx"].append(output["index"]["pocket_batch_idx"].detach() + offset)
 
-            if "pocket_center_batch_idx" in output["index"]:
-                self.pocket_center_batch_idx.append(output["index"]["pocket_center_batch_idx"].detach() + self.batch_offset)
+            if task == "pr":
+                append_if_exists(ds["pocket_centers"], output["labels"], "pocket_centers")
+                if "pocket_center_batch_idx" in output["index"]:
+                    ds["pocket_center_batch_idx"].append(output["index"]["pocket_center_batch_idx"].detach() + offset)
+                if "pocket_preds" in output["predictions"]:
+                    preds = output["predictions"]["pocket_preds"].detach()
+                    preds = F.pad(preds, (0, self.num_pocket_nodes - preds.shape[1]), value=-100)
+                    ds["pocket_preds"].append(preds)
 
-            append_if_exists(self.vs_preds, output["predictions"], "vs_preds")
-            append_if_exists(self.vs_labels, output["labels"], "vs_labels")
-            append_if_exists(self.ligand_idx, output["index"], "ligand_idx")
+                append_if_exists(ds["pr_ligand_idx"], output["index"], "ligand_idx")
 
-            if "ligand_batch_idx" in output["index"]:
-                self.ligand_batch_idx.append(output["index"]["ligand_batch_idx"].detach() + self.batch_offset)
-            self.batch_offset += output["index"]["pocket_center_batch_idx"].max().item() + 1
+                if "ligand_batch_idx" in output["index"]:
+                    ds["pr_ligand_batch_idx"].append(output["index"]["ligand_batch_idx"].detach() + offset)
 
-         # Save protein, pocket and ligand embeddings (if enabled)
+            if task in ("vs", "tf"):
+                append_if_exists(ds["vs_preds"], output["predictions"], "vs_preds")
+                append_if_exists(ds["vs_labels"], output["labels"], "vs_labels")
+                append_if_exists(ds["vs_ligand_idx"], output["index"], "ligand_idx")
+
+                if "ligand_batch_idx" in output["index"]:
+                    ds["vs_protein_names"].extend([output["protein_names"][idx] for idx in output["index"]["ligand_batch_idx"].cpu().tolist()])
+
+            if task in ("pp", "pr"):
+                if "pocket_center_batch_idx" in output["index"]:
+                    self._ds_offsets[dataset_name] += output["index"]["pocket_center_batch_idx"].max().item() + 1
+                else:
+                    self._ds_offsets[dataset_name] += len(output["protein_names"])
+
         if self.save_embeddings:
-            append_if_exists(self.pocket_embeddings, output["embeddings"], "pocket_embeddings")
+            append_if_exists(ds["pocket_embeddings"], output["embeddings"], "encoded_pockets")
 
             if self.protein_node:
-                append_if_exists(self.protein_embeddings, output["embeddings"], "protein_embeddings")
-                if "ligand_embeddings" in output["embeddings"]:
-                    self.ligand_embeddings_p = torch.cat([self.ligand_embeddings_p, output["embeddings"]["ligand_embeddings"][:, :output["embeddings"]["ligand_embeddings"].shape[1]//2].detach()])
-                    self.ligand_embeddings_b = torch.cat([self.ligand_embeddings_b, output["embeddings"]["ligand_embeddings"][:, output["embeddings"]["ligand_embeddings"].shape[1]//2:].detach()])
+                append_if_exists(ds["protein_embeddings"], output["embeddings"], "encoded_proteins")
+                if "encoded_ligands" in output["embeddings"]:
+                    encoded_ligands = output["embeddings"]["encoded_ligands"].detach()
+                    ds["ligand_embeddings_p"].append(encoded_ligands[:, :encoded_ligands.shape[1]//2])
+                    ds["ligand_embeddings_b"].append(encoded_ligands[:, encoded_ligands.shape[1]//2:])
             else:
-                append_if_exists(self.ligand_embeddings_b, output["embeddings"], "ligand_embeddings")
+                append_if_exists(ds["ligand_embeddings_b"], output["embeddings"], "encoded_ligands")
 
 
     def save_results(
-        self, 
-        dataset_name
+        self,
+        dataset_name: str,
+        results_dir: str,
     ) -> None:
         """
-        Save accumulated predictions and/or embeddings to disk.
+        Save accumulated predictions and/or embeddings for a single dataset.
 
         Parameters
         ----------
         dataset_name : str
-            Name of the dataset; used to create a dataset-specific subdirectory.
+            Name of the dataset whose accumulated data should be saved.
+        results_dir : str
+            Output directory for this dataset's results.
         """
 
-        # Create timestamped output directory
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        ds = self._ds[dataset_name]
 
-        # Save prediction results
         if self.save_predictions:
 
-            # Create directory for saving predictions
-            predictions_path = f"predictions/{dataset_name}/{timestamp}/"
+            predictions_path = os.path.join(results_dir, "predictions")
             os.makedirs(predictions_path, exist_ok=True)
-            
-            # Concatenate stored tensors for pocket prediction results
-            self.pocket_pos = torch.cat(self.pocket_pos, dim=0).cpu().numpy()
-            self.confidence = torch.cat(self.confidence, dim=0).cpu().numpy()
 
-            # Create DataFrame with predicted pocket coordinates and confidence scores
-            pp_df = pd.DataFrame(self.pocket_pos, columns=["pred_x", "pred_y", "pred_z"])
-            pp_df["confidence"] = self.confidence
-            pp_df["pocket_name"] = self.pocket_names
-            pp_df["protein_name"] = pp_df["pocket_name"].str.split("_").str[0]
+            # pp predictions
+            if ds.get("pocket_pos"):
+                pocket_pos = torch.cat(ds["pocket_pos"], dim=0).cpu().numpy()
+                confidence = torch.cat(ds["confidence"], dim=0).cpu().numpy()
 
-            # Save pocket prediction results to CSV
-            pp_df = pp_df[["protein_name", "pocket_name", "pred_x", "pred_y", "pred_z", "confidence"]]
-            pp_df.to_csv(os.path.join(predictions_path, "pp_predictions.csv"), index=False)
+                pp_df = pd.DataFrame(pocket_pos, columns=["pred_x", "pred_y", "pred_z"])
+                pp_df["confidence"] = confidence
+                pp_df["pocket_name"] = ds["pocket_names"]
+                pp_df["protein_name"] = pp_df["pocket_name"].str.split("_").str[0]
 
-            # Concatenate stored tensors for pocket ranking result
-            self.pocket_preds = torch.cat(self.pocket_preds, dim=0).cpu().numpy()
-            self.pocket_centers = torch.cat(self.pocket_centers, dim=0).cpu().numpy()
-            self.ligand_idx = torch.cat(self.ligand_idx, dim=0).cpu().numpy()
-            self.pocket_center_batch_idx = torch.cat(self.pocket_center_batch_idx, dim=0).cpu().numpy()
-            self.pocket_batch_idx = torch.cat(self.pocket_batch_idx, dim=0).cpu().numpy()
+                pp_df = pp_df[["protein_name", "pocket_name", "pred_x", "pred_y", "pred_z", "confidence"]]
+                pp_df.to_csv(os.path.join(predictions_path, "pp_predictions.csv"), index=False)
 
-            rows = []
+            # pr predictions
+            if ds.get("pocket_preds"):
+                pocket_preds = torch.cat(ds["pocket_preds"], dim=0).cpu().numpy()
+                pocket_batch_idx = torch.cat(ds["pocket_batch_idx"], dim=0).cpu().numpy()
+                pocket_pos = torch.cat(ds["pocket_pos"], dim=0).cpu().numpy()
+                confidence = torch.cat(ds["confidence"], dim=0).cpu().numpy()
+                pocket_names = np.array(ds["pocket_names"])
+                protein_names = ds["protein_names"]
 
-            # Iterate over each ground-truth pocket center
-            for i in range(self.pocket_centers.shape[0]):
+                pr_ligand_idx = torch.cat(ds["pr_ligand_idx"], dim=0).cpu().numpy() if ds["pr_ligand_idx"] else None
+                pr_ligand_batch_idx = torch.cat(ds["pr_ligand_batch_idx"], dim=0).cpu().numpy() if ds["pr_ligand_batch_idx"] else None
 
-                protein_idx = self.pocket_center_batch_idx[i].item()
-                protein_name = self.protein_names[protein_idx]
-                
-                target_xyz = self.pocket_centers[i]
-                ligand = self.ligand_idx[i].item()
+                has_labels = bool(ds.get("pocket_centers")) and bool(ds.get("pocket_center_batch_idx"))
 
-                scores = self.pocket_preds[i]
+                if has_labels:
+                    pocket_centers = torch.cat(ds["pocket_centers"], dim=0).cpu().numpy()
+                    pocket_center_batch_idx = torch.cat(ds["pocket_center_batch_idx"], dim=0).cpu().numpy()
 
-                # Iterate over predicted pockets for this protein
-                for pred_idx, score in enumerate(scores):
-                    
-                    # Ignore padded entries
-                    if score == -100:
-                        continue 
+                rows = []
 
-                    # Select predictions belonging to the current protein
+                if has_labels:
+                    for i in range(pocket_centers.shape[0]):
+                        protein_idx = pocket_center_batch_idx[i].item()
+                        protein_name = protein_names[protein_idx]
+                        target_xyz = pocket_centers[i]
+                        ligand = pr_ligand_idx[i].item()
+                        scores = pocket_preds[i]
 
-                    pred_xyz = self.pocket_pos[self.pocket_batch_idx == protein_idx][pred_idx]
-                    pocket_name = self.pocket_names[self.pocket_batch_idx == protein_idx][pred_idx]
-                    conf = self.confidence[self.pocket_batch_idx == protein_idx][pred_idx].item()
+                        for pred_idx, score in enumerate(scores):
+                            if score == -100:
+                                continue
+                            protein_mask = pocket_batch_idx == protein_idx
+                            pred_xyz = pocket_pos[protein_mask][pred_idx]
+                            pocket_name = pocket_names[protein_mask][pred_idx]
+                            conf = confidence[protein_mask][pred_idx].item()
+                            dist = np.linalg.norm(pred_xyz - target_xyz).item()
 
-                    # Compute Euclidean distance between predicted and target center
-                    dist = torch.norm(pred_xyz - target_xyz).item()
+                            rows.append({
+                                "protein_name": protein_name,
+                                "pocket_name": pocket_name,
+                                "ligand_idx": ligand,
+                                "pred_x": pred_xyz[0].item(),
+                                "pred_y": pred_xyz[1].item(),
+                                "pred_z": pred_xyz[2].item(),
+                                "target_x": target_xyz[0].item(),
+                                "target_y": target_xyz[1].item(),
+                                "target_z": target_xyz[2].item(),
+                                "confidence": conf,
+                                "conglude_score": score.item(),
+                                "distance": dist
+                            })
+                else:
+                    for i in range(pocket_preds.shape[0]):
+                        protein_idx = pr_ligand_batch_idx[i].item() if pr_ligand_batch_idx is not None else i
+                        protein_name = protein_names[protein_idx]
+                        ligand = pr_ligand_idx[i].item() if pr_ligand_idx is not None else i
+                        scores = pocket_preds[i]
 
-                    rows.append({
-                        "protein_name": protein_name,
-                        "pocket_name": pocket_name,
-                        "ligand_idx": ligand,
-                        "pred_x": pred_xyz[0].item(),
-                        "pred_y": pred_xyz[1].item(),
-                        "pred_z": pred_xyz[2].item(),
-                        "target_x": target_xyz[0].item(),
-                        "target_y": target_xyz[1].item(),
-                        "target_z": target_xyz[2].item(),
-                        "confidence": conf,
-                        "conglude_score": score.item(),
-                        "distance": dist
-                    })
+                        for pred_idx, score in enumerate(scores):
+                            if score == -100:
+                                continue
+                            protein_mask = pocket_batch_idx == protein_idx
+                            pred_xyz = pocket_pos[protein_mask][pred_idx]
+                            pocket_name = pocket_names[protein_mask][pred_idx]
+                            conf = confidence[protein_mask][pred_idx].item()
 
-            # Save pocket prediction results to CSV
-            pr_df = pd.DataFrame(rows)
-            pr_df.to_csv(os.path.join(predictions_path, "pr_predictions.csv"), index=False)
+                            rows.append({
+                                "protein_name": protein_name,
+                                "pocket_name": pocket_name,
+                                "ligand_idx": ligand,
+                                "pred_x": pred_xyz[0].item(),
+                                "pred_y": pred_xyz[1].item(),
+                                "pred_z": pred_xyz[2].item(),
+                                "confidence": conf,
+                                "conglude_score": score.item(),
+                            })
 
-            # Concatenate stored tensors for virtual screening results
-            self.vs_preds = torch.cat(self.vs_preds, dim=0).cpu().numpy()
-            self.vs_labels = torch.cat(self.vs_labels, dim=0).cpu().numpy()
-            self.ligand_batch_idx = torch.cat(self.ligand_batch_idx, dim=0).cpu().numpy()
-            
-            # Save virtual screening results to CSV
-            vs_df = pd.DataFrame({
-                "protein_name": [self.protein_names[i] for i in self.ligand_batch_idx.tolist()],
-                "ligand_idx": self.ligand_idx,
-                "vs_pred": self.vs_preds,
-                "vs_label": self.vs_labels,
-            })
-            vs_df.to_csv(os.path.join(predictions_path, "vs_predictions.csv"), index=False)
+                pr_df = pd.DataFrame(rows)
+                pr_df.to_csv(os.path.join(predictions_path, "pr_predictions.csv"), index=False)
 
-        # Save embeddings
+            # vs predictions
+            if ds.get("vs_preds"):
+                vs_preds = torch.cat(ds["vs_preds"], dim=0).cpu().numpy()
+                vs_labels = torch.cat(ds["vs_labels"], dim=0).cpu().numpy()
+                vs_ligand_idx = torch.cat(ds["vs_ligand_idx"], dim=0).cpu().numpy() if ds["vs_ligand_idx"] else None
+
+                vs_df = pd.DataFrame({
+                    "protein_name": ds["vs_protein_names"],
+                    "ligand_idx": vs_ligand_idx,
+                    "vs_pred": vs_preds,
+                    "vs_label": vs_labels,
+                })
+                vs_df.to_csv(os.path.join(predictions_path, "vs_predictions.csv"), index=False)
+
         if self.save_embeddings:
-            
-            # Create directory for saving embeddings
-            embeddings_path = f"embeddings/{dataset_name}/{timestamp}/"
-            os.makedirs(embeddings_path, exist_ok=True)
-            
-            # Save lists of protein and pocket names
-            write_list_to_txt(os.path.join(embeddings_path, "protein_names.txt"), self.protein_names)
-            write_list_to_txt(os.path.join(embeddings_path, "pocket_names.txt"), self.pocket_names)
 
-            # Save protein, pocket and ligand embeddings
-            self.pocket_embeddings = torch.cat(self.pocket_embeddings, dim=0)
-            np.save(os.path.join(embeddings_path, "pocket_embeddings.npy"), self.pocket_embeddings)
+            embeddings_path = os.path.join(results_dir, "embeddings")
+            os.makedirs(embeddings_path, exist_ok=True)
+
+            write_list_to_txt(os.path.join(embeddings_path, "protein_names.txt"), ds["protein_names"])
+            write_list_to_txt(os.path.join(embeddings_path, "pocket_names.txt"), ds["pocket_names"])
+
+            pocket_embeddings = torch.cat(ds["pocket_embeddings"], dim=0)
+            np.save(os.path.join(embeddings_path, "pocket_embeddings.npy"), pocket_embeddings)
 
             if self.protein_node:
-                self.protein_embeddings = torch.cat(self.protein_embeddings, dim=0)
-                np.save(os.path.join(embeddings_path, "protein_embeddings.npy"), self.protein_embeddings)
-                self.ligand_embeddings_p = torch.cat(self.ligand_embeddings_p, dim=0)
-                np.save(os.path.join(embeddings_path, "ligand_embeddings_p.npy"), self.ligand_embeddings_p)
+                protein_embeddings = torch.cat(ds["protein_embeddings"], dim=0)
+                np.save(os.path.join(embeddings_path, "protein_embeddings.npy"), protein_embeddings)
+                ligand_embeddings_p = torch.cat(ds["ligand_embeddings_p"], dim=0)
+                np.save(os.path.join(embeddings_path, "ligand_embeddings_p.npy"), ligand_embeddings_p)
 
-            self.ligand_embeddings_b = torch.cat(self.ligand_embeddings_b, dim=0)
-            np.save(os.path.join(embeddings_path, "ligand_embeddings_b.npy"), self.ligand_embeddings_b)
+            ligand_embeddings_b = torch.cat(ds["ligand_embeddings_b"], dim=0)
+            np.save(os.path.join(embeddings_path, "ligand_embeddings_b.npy"), ligand_embeddings_b)
+
+
+    def _write_pymol_scenes(self, dataset_name: str, results_dir: str) -> None:
+        """Save PyMOL-ready scenes for pocket visualization."""
+
+        ds = self._ds.get(dataset_name, {})
+        if not self.save_predictions or not ds.get("pocket_pos"):
+            return
+
+        pocket_pos = torch.cat(ds["pocket_pos"], dim=0).cpu().numpy()
+        confidence = torch.cat(ds["confidence"], dim=0).cpu().numpy()
+
+        visualization_root = os.path.join(results_dir, "predictions", "pymol_visualizations")
+
+        pp_df = pd.DataFrame({
+            "protein_name": ds["protein_names"],
+            "pocket_name": ds["pocket_names"],
+            "pred_x": pocket_pos[:, 0],
+            "pred_y": pocket_pos[:, 1],
+            "pred_z": pocket_pos[:, 2],
+            "confidence": confidence,
+        })
+
+        for protein_name, protein_df in pp_df.groupby("protein_name", sort=False):
+            protein_pdb_path = self._find_protein_pdb(protein_name)
+            if protein_pdb_path is None:
+                continue
+
+            create_pymol_scene(
+                protein_name=protein_name,
+                protein_pdb=protein_pdb_path,
+                pocket_df=protein_df,
+                output_dir=os.path.join(visualization_root, protein_name),
+            )
+
+
+    def _find_protein_pdb(self, protein_name: str) -> str:
+        """Return the cleaned PDB path for a protein if it exists."""
+
+        for dataloader in self.trainer.datamodule.test_dataloader():
+            data_dir = getattr(dataloader.dataset, "data_dir", None)
+            if data_dir is None:
+                continue
+
+            candidate_path = os.path.join(data_dir, "processed", "cleaned_pdbs", protein_name, "protein.pdb")
+            if os.path.isfile(candidate_path):
+                return candidate_path
+
+        return None
    
 
     def compute_and_log_metrics(
-        self, 
-        dataset_name: str
+        self,
+        dataset_name: str,
+        metrics_path=None
     ) -> dict:
         """
         Compute, log, and reset all metrics associated with a given dataset.
@@ -1231,18 +1338,23 @@ class ConGLUDeModel(pl.LightningModule):
         ----------
         dataset_name : str
             Name of the dataset whose metrics should be computed and logged, must be a key in `self.metrics`.
+        metrics_path : str, optional
+            Directory path for saving metrics CSVs. Only passed to metrics that support it.
         """
 
         all_metrics = {}
 
          # Iterate over all possible tasks
         for task in ["virtual_screening", "target_fishing", "pocket_prediction", "pocket_ranking"]:
-            
+
             # Only compute metrics if this dataset supports the given task
             if task in self.metrics[dataset_name]:
 
-                # Compute aggregated metric values
-                metrics_dict = self.metrics[dataset_name][task].compute()
+                # Compute aggregated metric values (pass metrics_path to all metrics that support it)
+                if metrics_path is not None:
+                    metrics_dict = self.metrics[dataset_name][task].compute(metrics_path)
+                else:
+                    metrics_dict = self.metrics[dataset_name][task].compute()
 
                 # Log each metric individually
                 for metric, result in metrics_dict.items():
@@ -1256,6 +1368,17 @@ class ConGLUDeModel(pl.LightningModule):
 
                 # Reset metric state after logging
                 self.metrics[dataset_name][task].reset()
+
+        # Save aggregate summary CSV
+        if metrics_path is not None and all_metrics:
+            import csv
+            os.makedirs(metrics_path, exist_ok=True)
+            summary_path = os.path.join(metrics_path, "summary.csv")
+            with open(summary_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["metric", "value"])
+                for metric, value in all_metrics.items():
+                    writer.writerow([metric, float(value)])
 
         return all_metrics
 
@@ -1328,9 +1451,13 @@ class ConGLUDeModel(pl.LightningModule):
         if self.lr_scheduler.func == PlateauWithWarmup:
             lr_scheduler = self.lr_scheduler(optimizer)
 
+            es_cbs = [cb for cb in self.trainer.callbacks if isinstance(cb, EarlyStopping)]
+            monitor = es_cbs[0].monitor if es_cbs else "avg_val/virtual_screening/bedroc"
+
+            optimizer_config["monitor"] = monitor
             optimizer_config["lr_scheduler"] = {
                 "scheduler": lr_scheduler,
-                "monitor": self.trainer.callbacks[0].monitor,
+                "monitor": monitor,
                 "interval": "epoch",
                 "frequency": self.trainer.check_val_every_n_epoch,
                 "reduce_on_plateau": True,
@@ -1420,15 +1547,15 @@ class ProteinModel(nn.Module):
         """
 
         # Load VNEGNN weights
-        vnegnn_state_dict = torch.load(f'{checkpoint_path}/vnegnn.pth', weights_only=True)
+        vnegnn_state_dict = torch.load(f'{checkpoint_path}/vnegnn.pth', weights_only=True, map_location=self.device)
         self.vnegnn.load_state_dict(vnegnn_state_dict)
 
         # Load pocket encoder weights
-        pocket_encoder_state_dict = torch.load(f'{checkpoint_path}/pocket_encoder.pth', weights_only=True)
+        pocket_encoder_state_dict = torch.load(f'{checkpoint_path}/pocket_encoder.pth', weights_only=True, map_location=self.device)
         self.pocket_encoder.load_state_dict(pocket_encoder_state_dict)
 
         # Load protein encoder weights
-        protein_encoder_state_dict = torch.load(f'{checkpoint_path}/protein_encoder.pth', weights_only=True)
+        protein_encoder_state_dict = torch.load(f'{checkpoint_path}/protein_encoder.pth', weights_only=True, map_location=self.device)
         self.protein_encoder.load_state_dict(protein_encoder_state_dict)
 
 

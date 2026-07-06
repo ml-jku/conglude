@@ -1,4 +1,5 @@
 from typing import List
+from datetime import datetime
 import torch
 import wandb
 import os
@@ -30,7 +31,7 @@ def init_lightning_callbacks(
 
     callbacks: List[Callback] = []
 
-    if "callbacks" in cfg:
+    if "callbacks" in cfg and cfg.callbacks is not None:
         for _, cb_conf in cfg.callbacks.items():
             if "_target_" in cb_conf:
                 log.info(f"Instantiating callback <{cb_conf._target_}>")
@@ -54,22 +55,23 @@ class CustomModelCheckpoint(ModelCheckpoint):
     """
     
     def __init__(
-        self, 
-        dirpath: str = None, 
+        self,
+        dirpath: str = None,
         **kwargs: dict,
     ) -> None:
-        
-         # Get the current Weights & Biases run ID
-        run_name = wandb.run.id
 
-        # Append run ID to checkpoint directory
-        if dirpath is None:
-            dirpath = f"checkpoints/{run_name}"
-        else:
-            dirpath = f"{dirpath}/{run_name}"
-        self.dirpath = dirpath
-        
+        self._base_dirpath = dirpath
         super().__init__(dirpath=dirpath, **kwargs)
+
+    def setup(self, trainer: pl.Trainer, pl_module: pl.LightningModule, stage: str = None) -> None:
+        run_name = wandb.run.id if wandb.run is not None else datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+        if self._base_dirpath is None:
+            self.dirpath = f"checkpoints/{run_name}"
+        else:
+            self.dirpath = f"{self._base_dirpath}/{run_name}"
+
+        super().setup(trainer, pl_module, stage)
 
 
     def on_save_checkpoint(

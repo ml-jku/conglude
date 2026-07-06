@@ -1,0 +1,5 @@
+  _target_: conglude.datamodule.DatasetList
+  defaults:
+    - _self_
+    - SB_val: SB_val
+    - LB_val: LB_val

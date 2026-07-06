@@ -1,7 +1,7 @@
 _target_: conglude.datamodule.ConGLUDeDataset
 
 dataset_dir: ./data/datasets/test_datasets/coach420
-dataset_name: coach420
+pdb_dir: ./data/pdb_files
 task: pp
 structure_based: true
 split: test

@@ -20,6 +20,7 @@ from Bio import BiopythonWarning
 import warnings
 from io import StringIO
 from rdkit.Chem import Descriptors, rdFingerprintGenerator
+from rdkit.ML.Descriptors import MoleculeDescriptors
 from rdkit import Chem, RDLogger
 import esm
 
@@ -89,6 +90,9 @@ class PDBGraphProcessor:
         Cutoff distance for defining neighboring residues in the protein graph.
     max_neighbors: int
         Maximum number of neighbors for each node in the graph.
+    standardize_input_smiles: bool
+        Whether to standardize SMILES read from input files (actives.txt, inactives.txt, smiles_affinities.csv)
+        through RDKit's MolFromSmiles/MolToSmiles round-trip. If False, SMILES are used as-is from the file.
     sanitize_smiles: bool
         Whether to sanitize the molecule with RDKit.
     remove_hs_smiles: bool
@@ -119,18 +123,19 @@ class PDBGraphProcessor:
         extract_ligands: str = "none", # "all", "none", "known", "combined", "from_file"
         labeled_smiles: str = "binary", # "none", "binary", "affinity"
         select_chains: str = "all", # "all", "closest", "chain_id", "uniprot", "uniprot_single"
-        multi_ligand: bool = True,
+        multi_ligand: bool = False,
         load_pocket: bool = False,
         multi_pdb_targets: bool = False,
         calc_mol_feats: bool = True,
-        
+
         dist_to_ligand: float = 4.0,
         min_subunit_size: int = 50,
-        max_num_subunits: int = 24,                 
+        max_num_subunits: int = 24,
         pocket_cutoff: float = 4.0,
         neighbor_dist_cutoff: float = 10.0,
         max_neighbors: int = 10,
 
+        standardize_input_smiles: bool = True,
         sanitize_smiles: bool = True,
         remove_hs_smiles: bool = True,
         canonical_smiles: bool = True,
@@ -141,7 +146,7 @@ class PDBGraphProcessor:
         save_complex_info: bool = False,
         device: str = "cuda:0"
     ) -> None:
-        
+
         self.dataset_dir = dataset_dir
         self.pdb_dir = pdb_dir
         self.common_data_dir = common_data_dir
@@ -164,6 +169,7 @@ class PDBGraphProcessor:
         self.neighbor_dist_cutoff = neighbor_dist_cutoff
         self.max_neighbors = max_neighbors
 
+        self.standardize_input_smiles = standardize_input_smiles
         self.sanitize_smiles = sanitize_smiles
         self.remove_hs_smiles = remove_hs_smiles
         self.canonical_smiles = canonical_smiles
@@ -1049,8 +1055,8 @@ class PDBGraphProcessor:
         ligand_ids = self.protein_ligand_dict[protein_id] if self.extract_ligands in ["known", "combined"] else None
         ligand_chain_dict = self.protein_chain_dict[protein_id] if self.select_chains == "chain_id" else None
               
-        # Attempt to download PDB file if it doesn't exist
         if not os.path.exists(os.path.join(self.pdb_dir, f"{protein_id}.pdb")):
+            print("PDB file not existing")
             if len(protein_id) == 4:
                 status_code = self.download_pdb(protein_id)
                 if status_code != 200:
@@ -1484,8 +1490,9 @@ class PDBGraphProcessor:
                         active_smiles = read_list_from_txt(os.path.join(smiles_files_dir, "actives.txt"))
                         valid = 0
                         for smiles in active_smiles:
-                            mol = Chem.MolFromSmiles(smiles)
-                            smiles = self.mol2smiles(mol)
+                            if self.standardize_input_smiles:
+                                mol = Chem.MolFromSmiles(smiles)
+                                smiles = self.mol2smiles(mol)
                             if smiles is not None and smiles != "":
                                 valid += 1
                                 if smiles in self.smiles2index_dict:
@@ -1493,7 +1500,7 @@ class PDBGraphProcessor:
                                 else:
                                     actives.append(len(self.smiles2index_dict))
                                     self.smiles2index_dict[smiles] = len(self.smiles2index_dict)
-                        
+
                     self.target2actives_dict[target] = actives
 
                     # Process inactive ligands
@@ -1501,8 +1508,9 @@ class PDBGraphProcessor:
                         inactive_smiles = read_list_from_txt(os.path.join(smiles_files_dir, "inactives.txt"))
                         valid = 0
                         for smiles in inactive_smiles:
-                            mol = Chem.MolFromSmiles(smiles)
-                            smiles = self.mol2smiles(mol)
+                            if self.standardize_input_smiles:
+                                mol = Chem.MolFromSmiles(smiles)
+                                smiles = self.mol2smiles(mol)
                             if smiles is not None and smiles != "":
                                 valid += 1
                                 if smiles in self.smiles2index_dict:
@@ -1529,8 +1537,9 @@ class PDBGraphProcessor:
                     if os.path.isfile(os.path.join(smiles_files_dir, "smiles_affinities.csv")):
                         smiles_affinity_df = pd.read_csv(os.path.join(smiles_files_dir, "smiles_affinities.csv"))
                         for smiles, aff in zip(smiles_affinity_df["smiles"], smiles_affinity_df["affinity"]):
-                            mol = Chem.MolFromSmiles(smiles)
-                            smiles = self.mol2smiles(mol)
+                            if self.standardize_input_smiles:
+                                mol = Chem.MolFromSmiles(smiles)
+                                smiles = self.mol2smiles(mol)
                             if smiles is not None and smiles != "":
                                 if smiles in self.smiles2index_dict:
                                     labeled_ligands.append(self.smiles2index_dict[smiles])
@@ -1913,16 +1922,20 @@ class LigandProcessor:
     num_workers: int
         Number of worker processes used for parallel ligand processing. If set to 1, processing runs in a single process.
     smiles_batch_size: int, default=1000
-        Number of SMILES strings processed per batch during parallel feature computation. 
+        Number of SMILES strings processed per batch during parallel feature computation.
     scaler_dir: str, default="data/common/scalers"
         Directory where fitted feature scalers are stored or loaded from.
     load_scaler: bool
         If True, attempts to load an existing fitted scaler from `scaler_dir` for feature normalization.
     save_scaler: bool
         If True, saves the fitted scaler to `scaler_dir` after computing normalization statistics.
+    save_pt: bool
+        If True, saves .pt files in addition to .dat memmap files.
+    show_progress: bool
+        If True, displays a progress bar during feature computation.
     """
 
-    def __init__(self, 
+    def __init__(self,
         dataset_dir: str,
         ecfp_radius: int = 2,
         fp_length: int = 2048,
@@ -1932,12 +1945,13 @@ class LigandProcessor:
         scaler_dir: str = "data/common/scalers",
         load_scaler: bool = True,
         save_scaler: bool = False,
-
+        save_pt: bool = True,
+        show_progress: bool = False,
     ):
         self.dataset_dir = dataset_dir
         self.ecfp_radius = ecfp_radius
         self.fp_length = fp_length
-        self.calc_descriptors = calc_descriptors  
+        self.calc_descriptors = calc_descriptors
 
         self.num_workers = num_workers
         self.smiles_batch_size = smiles_batch_size
@@ -1945,8 +1959,8 @@ class LigandProcessor:
         self.scaler_dir = scaler_dir
         self.load_scaler = load_scaler
         self.save_scaler = save_scaler
-
-        self.index2smiles_dict = read_json(os.path.join(self.dataset_dir, "processed", "ligand_embeddings", "index2smiles.json"))
+        self.save_pt = save_pt
+        self.show_progress = show_progress
 
 
     def calculate_ecfp(
@@ -1977,8 +1991,7 @@ class LigandProcessor:
         for idx, count in ecfp_counts.GetNonzeroElements().items():
             ecfp[idx % self.fp_length] += count
             
-        # Convert to a single tensor for downstream compatibility
-        ecfp = torch.tensor(ecfp, dtype=torch.float32)
+        ecfp = np.array(ecfp)
 
         return ecfp
     
@@ -2013,8 +2026,7 @@ class LigandProcessor:
                 # If descriptor calculation fails, append 0.0
                 descriptors.append(0.0)
 
-        # Convert list to a single tensor for downstream compatibility
-        descriptors = torch.tensor(descriptors, dtype=torch.float32)
+        descriptors = np.array(descriptors)
 
         return descriptors
     
@@ -2043,21 +2055,23 @@ class LigandProcessor:
         descriptors = []
 
         for smiles in smiles_list:
-            # Convert SMILES to RDKit molecule
+            smiles = smiles.strip('"').split(" |")[0].strip()
             mol = Chem.MolFromSmiles(smiles)
 
-            # Compute fingerprints
-            fingerprint = self.calculate_ecfp(mol)
-            fingerprints.append(fingerprint)
+            if mol is None:
+                print(smiles)
+                fingerprints.append(np.zeros(self.fp_length))
+                descriptors.append(np.zeros(210))
+            else:
+                fingerprint = self.calculate_ecfp(mol)
+                fingerprints.append(fingerprint)
 
-            # Compute chemical descriptors if required
-            if self.calc_descriptors:
-                descriptor = self.calculate_descriptors(mol)
-                descriptors.append(descriptor)
-        
-        # Convert lists to tensors (or None if no features were computed)
-        fingerprints = torch.stack(fingerprints, dim=0)
-        descriptors = torch.stack(descriptors, dim=0) if len(descriptors) != 0 else None
+                if self.calc_descriptors:
+                    descriptor = self.calculate_descriptors(mol)
+                    descriptors.append(descriptor)
+
+        fingerprints = np.stack(fingerprints, axis=0)
+        descriptors = np.stack(descriptors, axis=0)
 
         return fingerprints, descriptors
     
@@ -2132,7 +2146,7 @@ class LigandProcessor:
         return feature_matrix
 
     
-    def process(self):
+    def process(self, smiles_list=None):
 
         """
         Generate, normalize, and store ligand feature embeddings.
@@ -2140,51 +2154,64 @@ class LigandProcessor:
 
         if self.save_scaler:
             os.makedirs(os.path.join(self.scaler_dir), exist_ok=True)
-  
-        smiles_list = [self.index2smiles_dict[str(i)] for i in range(len(self.index2smiles_dict))]
-        
+
+        if smiles_list is None:
+            self.index2smiles_dict = read_json(os.path.join(self.dataset_dir, "processed", "ligand_embeddings", "index2smiles.json"))
+            smiles_list = [self.index2smiles_dict[str(i)] for i in range(len(self.index2smiles_dict))]
+
         print("Calculate ligand features")
         if self.num_workers > 1:
             num_batches = int(np.ceil(len(smiles_list)/self.smiles_batch_size))
             smiles_batches = [smiles_list[i*self.smiles_batch_size : (i+1)*self.smiles_batch_size] for i in range(num_batches-1)]
             smiles_batches.append(smiles_list[(num_batches-1)*self.smiles_batch_size :])
 
-            results = execute_in_parallel(func=self.get_ligand_embeddings, variable_args=smiles_batches, n_jobs=self.num_workers)
+            results = execute_in_parallel(
+                func=self.get_ligand_embeddings,
+                variable_args=smiles_batches,
+                n_jobs=self.num_workers,
+                desc="Computing fingerprints/descriptors" if self.show_progress else None,
+            )
             fingerprints_batches, descriptors_batches = zip(*results)
 
-            fingerprints = torch.cat([fp for fp in fingerprints_batches if fp is not None], dim=0)
+            fingerprints = np.concatenate([fp for fp in fingerprints_batches if fp is not None], axis=0)
             if self.calc_descriptors:
-                descriptors = torch.cat([descriptor for descriptor in descriptors_batches if descriptor is not None], dim=0)
+                descriptors = np.concatenate([descriptor for descriptor in descriptors_batches if descriptor is not None], axis=0)
 
         else:
             fingerprints, descriptors = self.get_ligand_embeddings(smiles_list)
+
+        fingerprints = torch.tensor(fingerprints, dtype=torch.float32)
+        if self.calc_descriptors:
+            descriptors = torch.tensor(descriptors, dtype=torch.float32)
 
         # Normalize and clean ligand embeddings
         fingerprints = self.clean_features(fingerprints)
         fingerprints = self.normalize_features(fingerprints, f"ecfp{2*self.ecfp_radius}_{self.fp_length}")
         fingerprints = self.clean_features(fingerprints)
-        
+
         print(f"Fingerprints shape: {fingerprints.shape}")
-        torch.save(fingerprints, os.path.join(self.dataset_dir, "processed", "ligand_embeddings", f"ecfp{2*self.ecfp_radius}_{self.fp_length}.pt"), pickle_protocol=4)
+        if self.save_pt:
+            torch.save(fingerprints, os.path.join(self.dataset_dir, "processed", "ligand_embeddings", f"ecfp{2*self.ecfp_radius}_{self.fp_length}.pt"), pickle_protocol=4)
 
         fp_fingerprints = np.memmap(os.path.join(self.dataset_dir, "processed", "ligand_embeddings", f"ecfp{2*self.ecfp_radius}_{self.fp_length}.dat"), dtype='float32', mode='w+', shape=fingerprints.shape)
         fp_fingerprints[:] = np.array(fingerprints)[:]
-            
+
         if self.calc_descriptors:
             descriptors = self.clean_features(descriptors)
             descriptors = self.normalize_features(descriptors, "descriptors")
             descriptors = self.clean_features(descriptors)
 
             print(f"Descriptors shape: {descriptors.shape}")
-            torch.save(descriptors, os.path.join(self.dataset_dir, "processed", "ligand_embeddings", "descriptors.pt"), pickle_protocol=4)
+            if self.save_pt:
+                torch.save(descriptors, os.path.join(self.dataset_dir, "processed", "ligand_embeddings", "descriptors.pt"), pickle_protocol=4)
 
             fp_descriptors = np.memmap(os.path.join(self.dataset_dir, "processed", "ligand_embeddings", "descriptors.dat"), dtype='float32', mode='w+', shape=descriptors.shape)
             fp_descriptors[:] = np.array(descriptors)[:]
-        
-            ligand_metadata = {"num_ligands": descriptors.shape[0], "descriptor_length": descriptors.shape[1], "fingerprint_length": fingerprints.shape[1]}
+
+            ligand_metadata = {"num_ligands": descriptors.shape[0], "descriptor_length": descriptors.shape[1], "fingerprint_length": fingerprints.shape[1], "precision": "float32"}
 
         else:
-            ligand_metadata = {"num_ligands": fingerprints.shape[0], "fingerprint_length": fingerprints.shape[1]}
+            ligand_metadata = {"num_ligands": fingerprints.shape[0], "fingerprint_length": fingerprints.shape[1], "precision": "float32"}
 
         write_json(os.path.join(self.dataset_dir, "processed", "ligand_embeddings", f"metadata_ecfp{2*self.ecfp_radius}_{self.fp_length}.json"), ligand_metadata)
 

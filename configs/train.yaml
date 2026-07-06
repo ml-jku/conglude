@@ -1,0 +1,16 @@
+defaults:
+  - _self_
+  - datamodule: train
+  - model: conglude
+  - trainer: default
+  - callbacks: default
+  - logger: wb
+  - hydra: default
+
+checkpoint_name: null   # set to a checkpoint name to resume from an existing checkpoint
+seed: 0
+debug: false
+precision: highest
+
+task: vs
+monitor: avg_val/virtual_screening/bedroc

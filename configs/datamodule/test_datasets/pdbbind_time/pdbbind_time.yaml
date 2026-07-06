@@ -1,7 +1,7 @@
 _target_: conglude.datamodule.ConGLUDeDataset
 
 dataset_dir: ./data/datasets/test_datasets/pdbbind_time
-dataset_name: pdbbind_time
+pdb_dir: ./data/pdb_files
 task: pr
 structure_based: true
 split: test

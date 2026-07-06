@@ -1,0 +1,12 @@
+_target_: conglude.datamodule.ConGLUDeDataset
+
+dataset_dir: ./data/datasets/train_val_datasets/LB_train_val
+dataset_name: LB_train
+task: ${task}
+structure_based: false
+split: train
+
+max_num_actives: 10000
+inactive_active_ratio: 3
+batch_size: 16
+debug: ${debug}
